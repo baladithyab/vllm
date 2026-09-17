@@ -313,7 +313,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
-    VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
+    VLLM_IDLE_STEP_SLEEP_S: float = 0.001
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -2105,7 +2105,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
     ),
-    # NIXL EP environment variables
+    # Idle scheduler-iteration GIL-yield duration in EngineCore's
+    # _process_engine_step (seconds). Streaming-input sessions whose next
+    # chunk has not arrived pay this once per iteration; 0 disables the
+    # yield entirely (busy-poll). Default preserves v0.29.0 behavior.
+    "VLLM_IDLE_STEP_SLEEP_S": lambda: float(
+        os.getenv("VLLM_IDLE_STEP_SLEEP_S", "0.001")
+    ),
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),

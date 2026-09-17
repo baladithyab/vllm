@@ -1479,8 +1479,17 @@ class EngineCoreProc(EngineCore):
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
+        # The yield duration is configurable: streaming-input sessions whose
+        # next chunk has not yet arrived sit in this branch once per scheduler
+        # iteration, so the 1ms default is a measurable per-chunk latency tax
+        # for them (measured ~30% of per-chunk commit overhead on v0.29.0;
+        # see s-s2s-b10-chains M1 traces, 2026-09-17). 0 disables the yield
+        # (busy-poll; safe when no background KV transfer threads rely on
+        # the GIL being released here).
         if not model_executed and self.scheduler.has_requests():
-            time.sleep(0.001)
+            _idle_sleep = envs.VLLM_IDLE_STEP_SLEEP_S
+            if _idle_sleep > 0:
+                time.sleep(_idle_sleep)
 
         return model_executed
 
