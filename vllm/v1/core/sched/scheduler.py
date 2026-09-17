@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -53,7 +54,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
@@ -212,6 +218,14 @@ class Scheduler(SchedulerInterface):
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
+
+        # Opt-in (VLLM_CHUNK_COALESCE): fold buffered prefill-only streaming
+        # chunks into one prefill instead of one scheduler iteration each.
+        # Each folded chunk owes the frontend a zero-token finish output (it
+        # tracks sessions one-finish-per-chunk); these are staged here and
+        # emitted at the start of the next update_from_output().
+        self.coalesce_streaming_chunks: bool = envs.VLLM_CHUNK_COALESCE
+        self._coalesced_chunk_finishes: list[tuple[int, EngineCoreOutput]] = []
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -1516,6 +1530,18 @@ class Scheduler(SchedulerInterface):
         # Extend prompt with kept output tokens.
         session.prompt_token_ids.extend(kept_output_tokens)
 
+        self._extend_session_prompt(session, update)
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
+
+    @staticmethod
+    def _extend_session_prompt(session: Request, update: StreamingUpdate) -> None:
+        """Appends the update's chunk (tokens, mm features, sampling params)
+        to the session's prompt."""
         if update.mm_features:
             base = session.num_tokens
             for mm_feature in update.mm_features:
@@ -1524,6 +1550,7 @@ class Scheduler(SchedulerInterface):
                 )
             session.mm_features.extend(update.mm_features)
 
+        assert session.prompt_token_ids is not None
         session._all_token_ids.extend(update.prompt_token_ids or ())
         session.prompt_token_ids.extend(update.prompt_token_ids or ())
         # Update block hashes for the new tokens.
@@ -1531,12 +1558,33 @@ class Scheduler(SchedulerInterface):
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
-        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-            self.num_waiting_for_streaming_input -= 1
-        session.status = RequestStatus.WAITING
 
+    def _coalesce_session_chunk(self, session: Request, update: StreamingUpdate) -> None:
+        """Folds a further input chunk into the session's pending (not yet
+        scheduled) prefill so a single scheduler iteration covers both.
+
+        Only valid for prefill-only sessions (max_tokens == 1): the chunk that
+        `update` would otherwise have followed contributes no kept output
+        token, so the concatenated prompt is exactly what sequential handling
+        would have produced. The folded chunk's sub-request never runs on its
+        own, so its finish output is staged as a zero-token LENGTH finish to
+        keep the frontend's one-finish-per-chunk session tracking in step.
+        """
+        assert session.max_tokens == 1
+        self._extend_session_prompt(session, update)
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+        self._coalesced_chunk_finishes.append(
+            (
+                session.client_index,
+                EngineCoreOutput(
+                    request_id=session.request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.LENGTH,
+                    trace_headers=session.trace_headers,
+                ),
+            )
+        )
 
     def _make_cached_request_data(
         self,
@@ -1825,6 +1873,13 @@ class Scheduler(SchedulerInterface):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        if self._coalesced_chunk_finishes:
+            # Finishes owed for chunks folded into a pending prefill since the
+            # last step (VLLM_CHUNK_COALESCE). Emitted ahead of this step's
+            # outputs so they precede the merged prefill's own finish.
+            for client_index, output in self._coalesced_chunk_finishes:
+                outputs[client_index].append(output)
+            self._coalesced_chunk_finishes.clear()
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -2260,6 +2315,12 @@ class Scheduler(SchedulerInterface):
                 # Streaming request finished.
                 return True
             self._update_request_as_session(request, update)
+            if self.coalesce_streaming_chunks and request.max_tokens == 1:
+                # Fold every further already-buffered chunk (up to the
+                # finished sentinel) into this one prefill.
+                queue = request.streaming_queue
+                while queue and queue[0] is not None:
+                    self._coalesce_session_chunk(request, queue.popleft())
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
@@ -2392,8 +2453,19 @@ class Scheduler(SchedulerInterface):
             update = StreamingUpdate.from_request(request)
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
                 assert existing.streaming_queue is not None, "duplicate request id"
-                # Queue next input chunk (or finished sentinel).
-                existing.streaming_queue.append(update)
+                if (
+                    self.coalesce_streaming_chunks
+                    and update is not None
+                    and existing.status == RequestStatus.WAITING
+                    and existing.max_tokens == 1
+                    and not existing.streaming_queue
+                ):
+                    # The previous chunk is still waiting to be scheduled:
+                    # fold this one into that same prefill.
+                    self._coalesce_session_chunk(existing, update)
+                else:
+                    # Queue next input chunk (or finished sentinel).
+                    existing.streaming_queue.append(update)
             elif update is not None:
                 # Commence next input chunk.
                 self._update_request_as_session(existing, update)

@@ -314,6 +314,8 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_IDLE_STEP_SLEEP_S: float = 0.001
+    VLLM_CHUNK_COALESCE: bool = False
+    VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -2112,6 +2114,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_IDLE_STEP_SLEEP_S": lambda: float(
         os.getenv("VLLM_IDLE_STEP_SLEEP_S", "0.001")
     ),
+    # Coalesce buffered streaming-input chunks (StreamingInput sessions whose
+    # chunks are prefill-only, i.e. max_tokens=1). When a chunk arrives for a
+    # session whose previous chunk has not been scheduled yet, or several
+    # chunks are queued when a chunk's sub-request stops, the scheduler folds
+    # them into ONE prefill instead of one scheduler iteration per chunk. Each
+    # folded chunk still yields its zero-token finish output so the frontend's
+    # one-finish-per-chunk bookkeeping is unchanged. Default preserves v0.29.0
+    # behavior (one scheduler iteration per chunk).
+    "VLLM_CHUNK_COALESCE": lambda: bool(int(os.getenv("VLLM_CHUNK_COALESCE", "0"))),
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
