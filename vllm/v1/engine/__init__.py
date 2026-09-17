@@ -233,6 +233,15 @@ class EngineCoreOutput(
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+    # Streaming-input chunks the scheduler folded into the finished
+    # sub-request's prefill (VLLM_CHUNK_COALESCE). The frontend tracks
+    # sessions one-finish-per-chunk, so it retires this many queued chunks in
+    # addition to the one this finish stands for. Appended last so
+    # `array_like` positional serialization stays compatible (a decoder without
+    # this field ignores the trailing element; one with it defaults a missing
+    # element). Always 0 unless the knob is on.
+    num_coalesced_chunks: int = 0
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

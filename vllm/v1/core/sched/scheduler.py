@@ -54,12 +54,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import (
-    EngineCoreEventType,
-    EngineCoreOutput,
-    EngineCoreOutputs,
-    FinishReason,
-)
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
@@ -221,11 +216,10 @@ class Scheduler(SchedulerInterface):
 
         # Opt-in (VLLM_CHUNK_COALESCE): fold buffered prefill-only streaming
         # chunks into one prefill instead of one scheduler iteration each.
-        # Each folded chunk owes the frontend a zero-token finish output (it
-        # tracks sessions one-finish-per-chunk); these are staged here and
-        # emitted at the start of the next update_from_output().
+        # The frontend tracks sessions one-finish-per-chunk, so folded chunks
+        # are counted on the request and reported on the merged sub-request's
+        # finish output (EngineCoreOutput.num_coalesced_chunks).
         self.coalesce_streaming_chunks: bool = envs.VLLM_CHUNK_COALESCE
-        self._coalesced_chunk_finishes: list[tuple[int, EngineCoreOutput]] = []
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
@@ -1588,24 +1582,21 @@ class Scheduler(SchedulerInterface):
         `update` would otherwise have followed contributes no kept output
         token, so the concatenated prompt is exactly what sequential handling
         would have produced. The folded chunk's sub-request never runs on its
-        own, so its finish output is staged as a zero-token LENGTH finish to
-        keep the frontend's one-finish-per-chunk session tracking in step.
+        own, so it is counted on the session and reported on the merged
+        sub-request's finish output (EngineCoreOutput.num_coalesced_chunks),
+        which keeps the frontend's one-finish-per-chunk tracking in step.
+        Emitting a separate zero-token finish per folded chunk instead would
+        put several outputs for one request into a single EngineCoreOutputs
+        batch; the frontend's RequestOutputCollector merges same-batch
+        outputs before the consumer can observe them, so the per-chunk
+        outputs a consumer sees on the stock (one step per chunk) path would
+        silently collapse.
         """
         assert session.max_tokens == 1
         self._extend_session_prompt(session, update)
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
-        self._coalesced_chunk_finishes.append(
-            (
-                session.client_index,
-                EngineCoreOutput(
-                    request_id=session.request_id,
-                    new_token_ids=[],
-                    finish_reason=FinishReason.LENGTH,
-                    trace_headers=session.trace_headers,
-                ),
-            )
-        )
+        session.num_coalesced_chunks += 1
 
     def _make_cached_request_data(
         self,
@@ -1894,13 +1885,6 @@ class Scheduler(SchedulerInterface):
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        if self._coalesced_chunk_finishes:
-            # Finishes owed for chunks folded into a pending prefill since the
-            # last step (VLLM_CHUNK_COALESCE). Emitted ahead of this step's
-            # outputs so they precede the merged prefill's own finish.
-            for client_index, output in self._coalesced_chunk_finishes:
-                outputs[client_index].append(output)
-            self._coalesced_chunk_finishes.clear()
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids = None
@@ -2128,10 +2112,17 @@ class Scheduler(SchedulerInterface):
                     )
 
             finish_reason = None
+            num_coalesced_chunks = 0
             if stopped:
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                # Likewise take the chunks folded into THIS sub-request before
+                # _handle_stopped_request, which may fold buffered chunks into
+                # the next one (VLLM_CHUNK_COALESCE). They ride on this finish
+                # so a request never has two outputs in one step.
+                num_coalesced_chunks = request.num_coalesced_chunks
+                request.num_coalesced_chunks = 0
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
@@ -2185,6 +2176,7 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        num_coalesced_chunks=num_coalesced_chunks,
                     )
                 )
             else:

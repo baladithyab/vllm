@@ -229,6 +229,10 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
+        # Input chunks folded into the pending sub-request's prefill
+        # (VLLM_CHUNK_COALESCE). Reported on that sub-request's finish output
+        # so the frontend retires one queued chunk per folded chunk.
+        self.num_coalesced_chunks = 0
 
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.

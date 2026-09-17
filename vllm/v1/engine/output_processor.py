@@ -655,6 +655,19 @@ class OutputProcessor:
                 # Ignore output for already-aborted request.
                 continue
 
+            if engine_core_output.num_coalesced_chunks:
+                # The scheduler folded these queued input chunks into the
+                # sub-request this finish reports (VLLM_CHUNK_COALESCE): they
+                # were part of its prompt and never ran on their own, so they
+                # produce no finish of their own. Retire them here, ahead of the
+                # regular one-chunk retirement below, so the session's chunk
+                # bookkeeping (and a `final` flag on any of them) stays in step.
+                assert req_state.input_chunk_queue is not None
+                for _ in range(engine_core_output.num_coalesced_chunks):
+                    req_state.apply_streaming_update(
+                        req_state.input_chunk_queue.popleft()
+                    )
+
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(
                 req_state, engine_core_output, engine_core_timestamp, iteration_stats
