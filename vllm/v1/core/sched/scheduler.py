@@ -1558,6 +1558,27 @@ class Scheduler(SchedulerInterface):
         session.num_prompt_tokens = len(session.prompt_token_ids)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
+        # Per-chunk sampling params must also drive the length cap: check_stop
+        # reads Request.max_tokens, which was only ever set from the FIRST
+        # chunk's params at construction. Without this, a prefill-only session
+        # (max_tokens=1 chunks) that commits with max_tokens=N decodes exactly
+        # one token and finishes FINISHED_LENGTH_CAPPED.
+        if (
+            update.sampling_params is not None
+            and update.sampling_params.max_tokens is not None
+        ):
+            session.max_tokens = update.sampling_params.max_tokens
+
+    @staticmethod
+    def _is_prefill_only_update(update: StreamingUpdate | None) -> bool:
+        """True for a buffered chunk that only extends the prompt (max_tokens
+        == 1): the only kind that may be folded into a pending prefill. The
+        commit chunk (real max_tokens) must always run its own iteration."""
+        return (
+            update is not None
+            and update.sampling_params is not None
+            and update.sampling_params.max_tokens == 1
+        )
 
     def _coalesce_session_chunk(self, session: Request, update: StreamingUpdate) -> None:
         """Folds a further input chunk into the session's pending (not yet
@@ -2316,10 +2337,12 @@ class Scheduler(SchedulerInterface):
                 return True
             self._update_request_as_session(request, update)
             if self.coalesce_streaming_chunks and request.max_tokens == 1:
-                # Fold every further already-buffered chunk (up to the
-                # finished sentinel) into this one prefill.
+                # Fold every further already-buffered PREFILL-ONLY chunk into
+                # this one prefill. Stop at the finished sentinel or at the
+                # first chunk with real sampling params (the commit), which
+                # must run its own iteration so its max_tokens/params apply.
                 queue = request.streaming_queue
-                while queue and queue[0] is not None:
+                while queue and self._is_prefill_only_update(queue[0]):
                     self._coalesce_session_chunk(request, queue.popleft())
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
@@ -2455,7 +2478,7 @@ class Scheduler(SchedulerInterface):
                 assert existing.streaming_queue is not None, "duplicate request id"
                 if (
                     self.coalesce_streaming_chunks
-                    and update is not None
+                    and self._is_prefill_only_update(update)
                     and existing.status == RequestStatus.WAITING
                     and existing.max_tokens == 1
                     and not existing.streaming_queue
